@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
  *
- * (C) COPYRIGHT 2018-2024 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2018-2025 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -61,6 +61,14 @@
 #define CSF_FIRMWARE_ENTRY_PROTECTED (1ul << 5)
 #define CSF_FIRMWARE_ENTRY_SHARED (1ul << 30)
 #define CSF_FIRMWARE_ENTRY_ZERO (1ul << 31)
+
+#define CSF_SCHED_PROTM_EVENT_ENTER (1 << 0)
+#define CSF_SCHED_PROTM_EVENT_ENTER_FW_ACK (1 << 1)
+#define CSF_SCHED_PROTM_EVENT_RESERVED_FLAG (1 << 2)
+#define CSF_SCHED_PROTM_EVENT_NR_FLAGS (3)
+#define CSF_SCHED_PROTM_EVENT_FLAGS_MASK ((1 << CSF_SCHED_PROTM_EVENT_NR_FLAGS) - 1)
+#define MAX_PROTM_EVENT_SEQ_NR (INT_MAX >> CSF_SCHED_PROTM_EVENT_NR_FLAGS)
+#define GET_PROTM_EVENT_ID_SEQ(event_id) ((event_id) >> CSF_SCHED_PROTM_EVENT_NR_FLAGS)
 
 /**
  * enum kbase_csf_queue_bind_state - bind state of the queue
@@ -435,7 +443,11 @@ struct kbase_queue {
 	kbase_refcount_t refcount;
 	struct kbase_queue_group *group;
 	struct kbase_va_region *queue_reg;
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+	struct kthread_work oom_event_work;
+#else
 	struct work_struct oom_event_work;
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 	u64 base_addr;
 	u32 size;
 	u8 priority;
@@ -547,6 +559,14 @@ struct kbase_protected_suspend_buffer {
  *                           or it becomes unblocked during protected mode. The
  *                           flag helps Scheduler confirm if the group actually
  *                           became non idle or not.
+ * @idle_on_stop: True if the group was idle or blocked on SYNC_WAIT at
+ *                the time it was suspended/terminated. This is used to handle
+ *                a race condition where the group was idle at the time of
+ *                suspension request, but it became active again before the
+ *                suspension request completes. This causes the scheduler to
+ *                treat the group as though it was suspended because of
+ *                preemption.
+ *                This is only used by scheduler_group_schedule().
  * @bound_queues:   Array of registered queues bound to this queue group.
  * @doorbell_nr:    Index of the hardware doorbell page assigned to the
  *                  group.
@@ -610,6 +630,7 @@ struct kbase_queue_group {
 	bool faulted;
 	bool cs_unrecoverable;
 	bool reevaluate_idle_status;
+	bool idle_on_stop;
 
 	struct kbase_queue *bound_queues[MAX_SUPPORTED_STREAMS_PER_GROUP];
 
@@ -1017,6 +1038,54 @@ struct kbase_csf_mcu_shared_regions {
 };
 
 /**
+ * struct kbase_csf_protm_mem_pages_defer_ctrl - Control data for managing the deferred
+ *                                       release of pages during a p.mode session.
+ *
+ * @mem_pools_op_lock:  Lock for synchronising the access to the internal pool lists etc.
+ * @mem_pools_list:     List that parks the pools where pages are deferred for releases.
+ * @op_pending_list:    internal list holding the mem_pools that are potentially ready to be
+ *                      released, before transition to in-flight state by the worker thread.
+ * @op_inflight_list:   List holding the single mem_pool that is in-flight with the release
+ *                      operation by the worker thread, after the associated p.mode session
+ *                      has completed
+ * @drop_op_pool:       Handshake delegating the deferral of control to remove the in-flight
+ *                      mem_pool, after returning from the in-flight call-back in which
+ *                      release of the deferred pages is attempted.
+ * @drop_op_pool_wait:  Event signalling back to the op_pool removal requester that the
+ *                      delegated task has been completed.
+ * @mem_pools_op_workq: Workqueue for performing thread context pages release operations.
+ * @mem_pools_op_work:  Work-item for triggering the release worker.
+ * @pools_term_wq:      Wait-mechanism for pools that have deferred pages undergoing a
+ *                      pool termination, which needs to be deferred until the relevant p.mode
+ *                      session has completed.
+ * @imported_bufs:      Tracking struct for imported buffers that need pmode-defer to free
+ * @protm_event_id:     P.mode event_id, consists of a sequence number and a flags field. The
+ *                      latter has a bit width of CSF_SCHED_PROTM_EVENT_NR_FLAGS (lowest-bits).
+ * @do_defer:           Flag indicating the deferring release action is required or not.
+ *                      When it's false, no deferring release actions is needed.
+ */
+struct kbase_csf_protm_mem_pages_defer_ctrl {
+	spinlock_t mem_pools_op_lock;
+	struct list_head mem_pools_list;
+	struct list_head op_pending_list;
+	struct list_head op_inflight_list;
+	struct kbase_mem_pool *drop_op_pool;
+	wait_queue_head_t drop_op_pool_wait;
+	struct workqueue_struct *mem_pools_op_workq;
+	struct work_struct mem_pools_op_work;
+	wait_queue_head_t pools_term_wq;
+	struct {
+		/** List that holds the buffer alloc items for deferred free */
+		struct list_head allocs_to_free;
+		/** The deferral sequence number for checking the ending condition */
+		int defer_seq;
+	} imported_bufs;
+	atomic_t protm_event_id;
+	/* Set at initialisation, true for GPUs up to Arch-15 */
+	bool do_defer;
+};
+
+/**
  * struct kbase_csf_scheduler - Object representing the scheduler used for
  *                              CSF for an instance of GPU platform device.
  * @lock:                  Lock to serialize the scheduler operations and
@@ -1170,6 +1239,7 @@ struct kbase_csf_mcu_shared_regions {
  *                          submissions.
  * @gpu_idle_timer_enabled: Tracks whether the GPU idle timer is enabled or disabled.
  * @fw_soi_enabled:         True if FW Sleep-on-Idle is currently enabled.
+ * @pages_defer_ctrl:       Control data for managing p.mode deferred pages on release.
  */
 struct kbase_csf_scheduler {
 	struct mutex lock;
@@ -1207,6 +1277,7 @@ struct kbase_csf_scheduler {
 #if IS_ENABLED(CONFIG_MALI_MTK_ADAPTIVE_POWER_POLICY)
 	unsigned int apo_support;
 	struct hrtimer apo_idle_timer;
+	bool keep_apo_timer;
 #endif /* CONFIG_MALI_MTK_ADAPTIVE_POWER_POLICY */
 	atomic_t pending_tick_work;
 	atomic_t pending_tock_work;
@@ -1258,8 +1329,12 @@ struct kbase_csf_scheduler {
 	 */
 	spinlock_t gpu_metrics_lock;
 #endif /* CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD */
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+	struct kthread_worker *oom_event_kthread_worker;
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 	atomic_t gpu_idle_timer_enabled;
 	atomic_t fw_soi_enabled;
+	struct kbase_csf_protm_mem_pages_defer_ctrl pages_defer_ctrl;
 };
 
 /*

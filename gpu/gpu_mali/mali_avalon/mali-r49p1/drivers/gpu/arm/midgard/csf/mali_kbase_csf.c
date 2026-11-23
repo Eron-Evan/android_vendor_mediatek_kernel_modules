@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 /*
  *
- * (C) COPYRIGHT 2018-2024 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2018-2025 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -22,6 +22,7 @@
 #include <mali_kbase.h>
 #include <gpu/mali_kbase_gpu_fault.h>
 #include <mali_kbase_reset_gpu.h>
+#include <mali_kbase_ctx_sched.h>
 #include "mali_kbase_csf.h"
 #include "backend/gpu/mali_kbase_pm_internal.h"
 #include <linux/export.h>
@@ -39,6 +40,10 @@
 #include "mali_kbase_csf_mcu_shared_reg.h"
 #include <linux/version_compat_defs.h>
 #include <csf/mali_kbase_csf_firmware_log.h>
+
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+#include <linux/kthread.h>
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 
 #if IS_ENABLED(CONFIG_MALI_MTK_WHITEBOX_MISSING_DOORBELL)
 #include <platform/mtk_platform_common.h>
@@ -62,6 +67,10 @@
 #include <ged_mali_event.h>
 #include <platform/mtk_platform_common/mtk_platform_mali_event.h>
 #endif /* CONFIG_MALI_MTK_MBRAIN_SUPPORT */
+
+#if IS_ENABLED(CONFIG_MIEV)
+#include <mi_event.h>
+#endif
 
 #define CS_REQ_EXCEPTION_MASK (CS_REQ_FAULT_MASK | CS_REQ_FATAL_MASK)
 #define CS_ACK_EXCEPTION_MASK (CS_ACK_FAULT_MASK | CS_ACK_FATAL_MASK)
@@ -291,6 +300,7 @@ static bool release_queue(struct kbase_queue *queue);
 void kbase_csf_free_command_stream_user_pages(struct kbase_context *kctx, struct kbase_queue *queue)
 {
 	kernel_unmap_user_io_pages(kctx, queue);
+	queue->user_io_addr = NULL;
 
 	kbase_mem_pool_free_pages(&kctx->mem_pools.small[KBASE_MEM_GROUP_CSF_IO],
 				  KBASEP_NUM_CS_USER_IO_PAGES, queue->phys, true, false);
@@ -453,7 +463,11 @@ static bool release_queue(struct kbase_queue *queue)
 	return false;
 }
 
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+static void oom_event_worker(struct kthread_work *data);
+#else
 static void oom_event_worker(struct work_struct *data);
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 static void cs_error_worker(struct work_struct *data);
 
 /* Between reg and reg_ex, one and only one must be null */
@@ -571,7 +585,11 @@ static int csf_queue_register_internal(struct kbase_context *kctx,
 	INIT_LIST_HEAD(&queue->link);
 	atomic_set(&queue->pending_kick, 0);
 	INIT_LIST_HEAD(&queue->pending_kick_link);
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+	kthread_init_work(&queue->oom_event_work, oom_event_worker);
+#else
 	INIT_WORK(&queue->oom_event_work, oom_event_worker);
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 	INIT_WORK(&queue->cs_error_work, cs_error_worker);
 	list_add(&queue->link, &kctx->csf.queue_list);
 
@@ -721,7 +739,14 @@ void kbase_csf_queue_terminate(struct kbase_context *kctx,
 		}
 		wait_pending_queue_kick(queue);
 		/* The work items can be cancelled as Userspace is terminating the queue */
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+		kthread_cancel_work_sync(&queue->oom_event_work);
+#if IS_ENABLED(CONFIG_MALI_MTK_KBASE_THREAD_DEBUG)
+		mali_kthread_event("cancel work", queue, "oom_event_worker");
+#endif /* CONFIG_MALI_MTK_KBASE_THREAD_DEBUG */
+#else
 		cancel_work_sync(&queue->oom_event_work);
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 		cancel_work_sync(&queue->cs_error_work);
 		mutex_lock(&kctx->csf.lock);
 
@@ -755,6 +780,12 @@ int kbase_csf_queue_bind(struct kbase_context *kctx, union kbase_ioctl_cs_queue_
 
 	if (bind->in.csi_index >= max_streams)
 		goto out;
+
+	if (queue->user_io_addr != NULL) {
+		dev_err(kctx->kbdev->dev, "Queue with stale user_io address: %pK",
+			(void *)queue->user_io_addr);
+		goto out;
+	}
 
 	if (group->run_state == KBASE_CSF_GROUP_TERMINATED)
 		goto out;
@@ -1282,6 +1313,7 @@ static int create_queue_group(struct kbase_context *const kctx,
 			group->faulted = false;
 			group->cs_unrecoverable = false;
 			group->reevaluate_idle_status = false;
+			group->idle_on_stop = false;
 
 			group->csg_reg = NULL;
 			group->csg_reg_bind_retries = 0;
@@ -1853,8 +1885,6 @@ void kbase_csf_ctx_handle_fault(struct kbase_context *kctx, struct kbase_fault *
 void kbase_csf_ctx_term(struct kbase_context *kctx)
 {
 	struct kbase_device *kbdev = kctx->kbdev;
-	struct kbase_as *as = NULL;
-	unsigned long flags;
 	u32 i;
 	int err;
 	bool reset_prevented = false;
@@ -1938,15 +1968,57 @@ void kbase_csf_ctx_term(struct kbase_context *kctx)
 	flush_work(&kctx->kbdev->csf.fw_error_work);
 
 	/* A work item to handle page_fault/bus_fault/gpu_fault could be
-	 * pending for the outgoing context. Flush the workqueue that will
-	 * execute that work item.
+	 * pending for the outgoing context which we no longer care about.
+	 * Ensure that the context won't be accessed anymore by the fault
+	 * workers.
 	 */
-	spin_lock_irqsave(&kctx->kbdev->hwaccess_lock, flags);
-	if (kctx->as_nr != KBASEP_AS_NR_INVALID)
-		as = &kctx->kbdev->as[kctx->as_nr];
-	spin_unlock_irqrestore(&kctx->kbdev->hwaccess_lock, flags);
-	if (as)
-		flush_workqueue(as->pf_wq);
+	while (true) {
+		unsigned long flags;
+		int refcount;
+
+		mutex_lock(&kbdev->mmu_hw_mutex);
+		spin_lock_irqsave(&kbdev->hwaccess_lock, flags);
+
+		refcount = atomic_read(&kctx->refcount);
+		if ((refcount != 0) && !WARN_ON_ONCE(kctx->as_nr == KBASEP_AS_NR_INVALID)) {
+			struct kbase_as *as = &kctx->kbdev->as[kctx->as_nr];
+			int new_refcount;
+
+			dev_dbg(kbdev->dev,
+				"Waiting for pending fault worker to complete when terminating context (%d_%d)",
+				kctx->tgid, kctx->id);
+			spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
+			mutex_unlock(&kbdev->mmu_hw_mutex);
+			flush_workqueue(as->pf_wq);
+
+			new_refcount = atomic_read(&kctx->refcount);
+			if (refcount != new_refcount) {
+				/* Fault workers executed and released some references, re-check */
+				continue;
+			} else {
+				/* Waiting for pending fault workers to execute was not effective,
+				 * we're going to forcefully de-assign the AS from this context
+				 * because nothing else should still be accessing the context at
+				 * this point.
+				 *
+				 * This should never happen and a WARN_ON() would be printed by
+				 * kbase_ctx_sched_remove_ctx() if the refcount is non-zero.
+				 */
+				dev_warn(
+					kbdev->dev,
+					"No fault workers executed, %d refs remain for terminating context (%d_%d)",
+					new_refcount, kctx->tgid, kctx->id);
+				kbase_ctx_sched_remove_ctx(kctx);
+			}
+		} else {
+			kbase_ctx_sched_remove_ctx_nolock(kctx);
+
+			spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
+			mutex_unlock(&kbdev->mmu_hw_mutex);
+		}
+
+		break;
+	}
 
 	mutex_lock(&kctx->csf.lock);
 
@@ -2215,12 +2287,25 @@ unlock:
  * releases a reference that was added to prevent the queue being destroyed
  * while this work item was pending on a workqueue.
  */
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+static void oom_event_worker(struct kthread_work *data)
+#else
 static void oom_event_worker(struct work_struct *data)
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 {
 	struct kbase_queue *queue = container_of(data, struct kbase_queue, oom_event_work);
 	struct kbase_context *kctx = queue->kctx;
 	struct kbase_device *const kbdev = kctx->kbdev;
 	int reset_prevent_err = kbase_reset_gpu_try_prevent(kbdev);
+
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+#if IS_ENABLED(CONFIG_MALI_MTK_KBASE_TRACE_DEBUG)
+	MALI_TRACE_BEGIN("oom_event_worker");
+#endif /* CONFIG_MALI_MTK_KBASE_TRACE_DEBUG */
+#if IS_ENABLED(CONFIG_MALI_MTK_KBASE_THREAD_DEBUG)
+	mali_kthread_event("work start", queue, "oom_event_worker");
+#endif /* CONFIG_MALI_MTK_KBASE_THREAD_DEBUG */
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 
 	mutex_lock(&kctx->csf.lock);
 	if (likely(!reset_prevent_err)) {
@@ -2232,6 +2317,23 @@ static void oom_event_worker(struct work_struct *data)
 	mutex_unlock(&kctx->csf.lock);
 	if (likely(!reset_prevent_err))
 		kbase_reset_gpu_allow(kbdev);
+
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+#if IS_ENABLED(CONFIG_MALI_MTK_KBASE_THREAD_DEBUG)
+	mali_kthread_event("work end", queue, "oom_event_worker");
+#endif /* CONFIG_MALI_MTK_KBASE_THREAD_DEBUG */
+#if IS_ENABLED(CONFIG_MALI_MTK_KBASE_TRACE_DEBUG)
+	MALI_TRACE_END();
+#endif /* CONFIG_MALI_MTK_KBASE_TRACE_DEBUG */
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_WORKER_TOO_LONG_DEBUG)
+	// if worker execute too long, trigger debug message
+	execute_time = ktime_to_ms(ktime_sub(ktime_get(), begin_timestamp));
+	if (execute_time >= KBASE_FUNCTION_EXECUTE_DEBUG_TIMEOUT) {
+		dev_err(kbdev->dev, "ctx:%d_%d %s too long! (%llums)", kctx->tgid, kctx->id, __func__, execute_time);
+	}
+#endif /* CONFIG_MALI_MTK_WORKER_TOO_LONG_DEBUG */
 }
 
 /**
@@ -2954,6 +3056,10 @@ static void handle_fatal_event(struct kbase_queue *const queue,
 			 kbase_gpu_exception_name(cs_fatal_exception_type), cs_fatal_exception_data,
 			 cs_fatal_info_exception_data);
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+
+#if IS_ENABLED(CONFIG_MIEV)
+		mi_disp_mievent_report(MI_EVENT_GPU_CS_FAULT);
+#endif
 	}
 
 	if (cs_fatal_exception_type == CS_FATAL_EXCEPTION_TYPE_FIRMWARE_INTERNAL_ERROR) {
@@ -3034,7 +3140,11 @@ static void process_cs_interrupts(struct kbase_queue_group *const group,
 			struct kbase_csf_cmd_stream_info const *const stream = &ginfo->streams[i];
 			u32 const cs_req = kbase_csf_firmware_cs_input_read(stream, CS_REQ);
 			u32 const cs_ack = kbase_csf_firmware_cs_output(stream, CS_ACK);
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+			struct kthread_worker *worker = kbdev->csf.scheduler.oom_event_kthread_worker;
+#else
 			struct workqueue_struct *wq = group->kctx->csf.wq;
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 
 			if ((cs_ack & CS_ACK_FATAL_MASK) != (cs_req & CS_REQ_FATAL_MASK)) {
 				KBASE_KTRACE_ADD_CSF_GRP_Q(kbdev, CSI_INTERRUPT_FAULT, group, queue,
@@ -3066,7 +3176,11 @@ static void process_cs_interrupts(struct kbase_queue_group *const group,
 			if (((cs_req & CS_REQ_TILER_OOM_MASK) ^ (cs_ack & CS_ACK_TILER_OOM_MASK))) {
 				KBASE_KTRACE_ADD_CSF_GRP_Q(kbdev, CSI_INTERRUPT_TILER_OOM, group,
 							   queue, cs_req ^ cs_ack);
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+				if (!kthread_queue_work(worker, &queue->oom_event_work)) {
+#else
 				if (!queue_work(wq, &queue->oom_event_work)) {
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 					/* The work item shall not have been
 					 * already queued, there can be only
 					 * one pending OoM event for a
@@ -3088,6 +3202,11 @@ static void process_cs_interrupts(struct kbase_queue_group *const group,
 						queue->kctx->id);
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
 				}
+#if IS_ENABLED(CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT)
+#if IS_ENABLED(CONFIG_MALI_MTK_KBASE_THREAD_DEBUG)
+				mali_kthread_event("queue work", queue, "oom_event_worker");
+#endif /* CONFIG_MALI_MTK_KBASE_THREAD_DEBUG */
+#endif /* CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT */
 			}
 
 			if ((cs_req & CS_REQ_PROTM_PEND_MASK) ^ (cs_ack & CS_ACK_PROTM_PEND_MASK)) {
@@ -3364,7 +3483,10 @@ static inline void check_protm_enter_req_complete(struct kbase_device *kbdev, u3
 	if ((glb_req & GLB_REQ_PROTM_ENTER_MASK) != (glb_ack & GLB_REQ_PROTM_ENTER_MASK))
 		return;
 
-	dev_dbg(kbdev->dev, "Protected mode entry interrupt received");
+	kbase_csf_scheduler_append_protm_flag(kbdev, CSF_SCHED_PROTM_EVENT_ENTER_FW_ACK);
+	dev_dbg(kbdev->dev, "Protected mode entry interrupt received, event_seq: %d",
+		GET_PROTM_EVENT_ID_SEQ(
+			atomic_read(&kbdev->csf.scheduler.pages_defer_ctrl.protm_event_id)));
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 	mtk_logbuffer_type_print(kbdev, MTK_LOGBUFFER_TYPE_REGULAR,
 		"Protected mode entry interrupt received\n");
@@ -3415,6 +3537,7 @@ static inline void process_protm_exit(struct kbase_device *kbdev, u32 glb_ack)
 
 	if (!WARN_ON(!kbdev->protected_mode)) {
 		kbdev->protected_mode = false;
+		kbase_csf_scheduler_complete_protm_event(kbdev);
 #if IS_ENABLED(CONFIG_MALI_MTK_GPU_DVFS_HINT_26M_LOADING)
 		ged_dvfs_write_sysram_protm_exit();
 #endif /* CONFIG_MALI_MTK_GPU_DVFS_HINT_26M_LOADING */

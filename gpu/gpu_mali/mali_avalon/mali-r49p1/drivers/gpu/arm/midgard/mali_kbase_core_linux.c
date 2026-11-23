@@ -174,6 +174,10 @@ struct v1_data *gpu_info_ref;
 #include <platform/mtk_platform_common/mtk_platform_mali_event.h>
 #endif /* CONFIG_MALI_MTK_MBRAIN_SUPPORT */
 
+#if IS_ENABLED(CONFIG_MIEV)
+#include <mi_event.h>
+#endif
+
 #define KERNEL_SIDE_DDK_VERSION_STRING "K:" MALI_RELEASE_NAME "(GPL)"
 
 /**
@@ -1828,6 +1832,10 @@ static int kbasep_ioctl_set_limited_core_count(
 static int kbasep_ioctl_internal_fence_wait(struct kbase_context *kctx,
 			struct kbase_ioctl_internal_fence_wait *fence_wait)
 {
+#if IS_ENABLED(CONFIG_MIEV)
+	mi_disp_mievent_report(MI_EVENT_GPU_REQUEST_TIMEOUT);
+#endif
+
 #if IS_ENABLED(CONFIG_MALI_MTK_MBRAIN_SUPPORT)
 	if (fence_wait->time_in_microseconds == 2000 || fence_wait->time_in_microseconds == 3000 ||
 		fence_wait->time_in_microseconds == 4000 || fence_wait->time_in_microseconds == 5000) {
@@ -3650,6 +3658,45 @@ static ssize_t gpuinfo_show(struct device *dev, struct device_attribute *attr, c
 			 gpu_props->gpu_id.version_minor, product_id);
 }
 static DEVICE_ATTR_RO(gpuinfo);
+
+
+#if IS_ENABLED(CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG)
+static ssize_t upf_counter_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct kbase_device *kbdev;
+
+	CSTD_UNUSED(attr);
+
+	kbdev = to_kbase_device(dev);
+	if (!kbdev)
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "upf_counter = %lld\n", mtk_common_upf_counter_get());
+}
+static ssize_t upf_counter_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct kbase_device *kbdev = dev_get_drvdata(dev);
+	u32 reset_value;
+
+	CSTD_UNUSED(attr);
+
+	if (!kbdev) {
+		pr_info("[KBASE] Bad kbdev!\n");
+		return -ENODEV;
+	}
+
+	if (kstrtouint(buf, 0, &reset_value))
+		return -EINVAL;
+
+	if (reset_value == 0) {
+		mtk_common_upf_counter_reset();
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(upf_counter);
+#endif /* CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG */
+
 
 /**
  * dvfs_period_store - Store callback for the dvfs_period sysfs file.
@@ -6298,6 +6345,9 @@ static struct attribute *kbase_attrs[] = {
 #if IS_ENABLED(CONFIG_MALI_MTK_ACP_FORCE_SYNC_DEBUG)
 	&dev_attr_force_cache_sync.attr,
 #endif /* CONFIG_MALI_MTK_ACP_FORCE_SYNC_DEBUG */
+#if IS_ENABLED(CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG)
+	&dev_attr_upf_counter.attr,
+#endif /* CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG */
 	NULL
 };
 

@@ -35,6 +35,8 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_PROC_FS := y
         CONFIG_MTK_GPU_SWPM_SUPPORT :=y
         CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
+        CONFIG_MALI_MTK_PREVENT_PRINTK_TOO_MUCH := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
     endif
 endif
 
@@ -57,6 +59,8 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_GPU_BM_2 := y
         CONFIG_MALI_MTK_SHADER_PWR_CTL_WA := y
         CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
+        CONFIG_MALI_MTK_PREVENT_PRINTK_TOO_MUCH := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
     endif
 endif
 
@@ -73,10 +77,12 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_MEMTRACK :=y
         CONFIG_MALI_MTK_DEVFREQ_GOVERNOR := y
         CONFIG_MALI_MTK_DEVFREQ_THERMAL := y
+        CONFIG_MALI_MTK_PREVENT_PRINTK_TOO_MUCH := y
         CONFIG_MALI_MTK_PROC_FS := y
         CONFIG_MTK_GPU_SWPM_SUPPORT :=y
         CONFIG_MALI_MTK_GPU_BM_2 := y
         CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
     endif
 endif
 
@@ -93,10 +99,12 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_MEMTRACK :=y
         CONFIG_MALI_MTK_DEVFREQ_GOVERNOR := y
         CONFIG_MALI_MTK_DEVFREQ_THERMAL := y
+        CONFIG_MALI_MTK_PREVENT_PRINTK_TOO_MUCH := y
         CONFIG_MALI_MTK_PROC_FS := y
         CONFIG_MTK_GPU_SWPM_SUPPORT :=y
         CONFIG_MALI_MTK_GPU_BM_2 := y
         CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
     endif
 endif
 
@@ -109,19 +117,45 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MIDGARD_DVFS := y
         CONFIG_MALI_DEVFREQ := y
         # *** MTK CONFIG ***
+        CONFIG_MALI_MTK_MGMM := y
         CONFIG_MALI_MTK_BRINGUP := n
         CONFIG_MALI_MTK_MEMTRACK :=y
         CONFIG_MALI_MTK_DEVFREQ_GOVERNOR := y
         CONFIG_MALI_MTK_DEVFREQ_THERMAL := y
+        CONFIG_MALI_MTK_PREVENT_PRINTK_TOO_MUCH := y
         CONFIG_MALI_MTK_PROC_FS := y
         CONFIG_MTK_GPU_SWPM_SUPPORT :=y
         CONFIG_MALI_MTK_GPU_BM_2 := y
         CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
     endif
 endif
 
 ifeq ($(BUILD_RULE),OOT)
     ifeq ($(MTK_PLATFORM_VERSION),mt6781)
+        MTK_GPU_VERSION := $(LOCAL_MTK_GPU_VERSION)
+        MTK_PLATFORM := $(MTK_PLATFORM_VERSION)
+        CONFIG_MALI_REAL_HW := y
+        CONFIG_MALI_DEBUG := y
+        CONFIG_MALI_MIDGARD_DVFS := y
+        CONFIG_MALI_DEVFREQ := y
+        # *** MTK CONFIG ***
+        CONFIG_MALI_MTK_MGMM := y
+        CONFIG_MALI_MTK_BRINGUP := n
+        CONFIG_MALI_MTK_MEMTRACK :=y
+        CONFIG_MALI_MTK_DEVFREQ_GOVERNOR := y
+        CONFIG_MALI_MTK_DEVFREQ_THERMAL := y
+        CONFIG_MALI_MTK_PREVENT_PRINTK_TOO_MUCH := y
+        CONFIG_MALI_MTK_PROC_FS := y
+        CONFIG_MTK_GPU_SWPM_SUPPORT :=y
+        CONFIG_MALI_MTK_GPU_BM_2 := y
+        CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
+    endif
+endif
+
+ifeq ($(BUILD_RULE),OOT)
+    ifeq ($(MTK_PLATFORM_VERSION),mt6771)
         MTK_GPU_VERSION := $(LOCAL_MTK_GPU_VERSION)
         MTK_PLATFORM := $(MTK_PLATFORM_VERSION)
         CONFIG_MALI_REAL_HW := y
@@ -135,7 +169,6 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_DEVFREQ_THERMAL := y
         CONFIG_MALI_MTK_PROC_FS := y
         CONFIG_MTK_GPU_SWPM_SUPPORT :=y
-        CONFIG_MALI_MTK_GPU_BM_2 := y
         CONFIG_MALI_TRACE_POWER_GPU_WORK_PERIOD := y
     endif
 endif
@@ -255,6 +288,8 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_POWER_RESET := y
         CONFIG_MALI_MTK_ACP_FORCE_SYNC_DEBUG := y
         CONFIG_MALI_MTK_DEFERRED_LOGGING := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
+        CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT := y
     endif ## mt6899 ##
 endif
 
@@ -433,6 +468,8 @@ ifeq ($(BUILD_RULE),OOT)
         CONFIG_MALI_MTK_ACP_FORCE_SYNC_DEBUG := y
         CONFIG_MALI_MTK_API_SYNC_UPDATE := y
         CONFIG_MALI_MTK_DEFERRED_LOGGING := y
+        CONFIG_MALI_MTK_USE_KTHREAD_WORKER_FOR_OOMEVENT := y
+        CONFIG_MALI_MTK_GPU_FREQUENCY_TRACE := y
     endif ## mt6991 ##
 endif
 
@@ -636,7 +673,8 @@ mali_kbase-y += \
     mali_kbase_dvfs_debugfs.o \
     mali_power_gpu_frequency_trace.o \
     mali_kbase_trace_gpu_mem.o \
-    mali_kbase_pbha.o
+    mali_kbase_pbha.o \
+    mi_event.o
 
 mali_kbase-$(CONFIG_DEBUG_FS) += mali_kbase_pbha_debugfs.o
 

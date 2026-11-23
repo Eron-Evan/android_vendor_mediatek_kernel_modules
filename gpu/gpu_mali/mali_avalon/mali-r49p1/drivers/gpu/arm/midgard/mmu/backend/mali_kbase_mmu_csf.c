@@ -44,6 +44,10 @@
 #include <platform/mtk_platform_common/mtk_platform_mali_event.h>
 #endif /* CONFIG_MALI_MTK_MBRAIN_SUPPORT */
 
+#if IS_ENABLED(CONFIG_MIEV)
+#include <mi_event.h>
+#endif
+
 void kbase_mmu_get_as_setup(struct kbase_mmu_table *mmut, struct kbase_mmu_setup *const setup)
 {
 	/* Set up the required caching policies at the correct indices
@@ -652,7 +656,9 @@ void kbase_mmu_report_fault_and_kill(struct kbase_context *kctx, struct kbase_as
 
 		/* terminal fault, print info about the fault */
 		if (kbdev->gpu_props.gpu_id.product_model < GPU_ID_MODEL_MAKE(14, 0)) {
-#if IS_ENABLED(CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG)
+#if IS_ENABLED(CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG)\
+			/* Add the unhandled page fault counter for recording */
+			mtk_common_upf_counter_add();
 			dev_err(kbdev->dev,
 				"Unhandled Page fault (p-mode %d) in AS%u at VA 0x%016llX\n"
 				"Reason: %s\n"
@@ -696,6 +702,10 @@ void kbase_mmu_report_fault_and_kill(struct kbase_context *kctx, struct kbase_as
 									   access_type),
 				kctx->pid);
 #endif /* CONFIG_MALI_MTK_UNHANDLED_PAGE_FAULT_DEBUG */
+
+#if IS_ENABLED(CONFIG_MIEV)
+			mi_disp_mievent_report(MI_EVENT_GPU_PAGE_FAULT);
+#endif
 		}
 
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
@@ -992,6 +1002,10 @@ static void kbase_mmu_gpu_fault_worker(struct work_struct *data)
 		 status, kbase_gpu_exception_name(GPU_FAULTSTATUS_EXCEPTION_TYPE_GET(status)),
 		 as_nr, (void *)phys_addr, as_valid ? "true" : "false",
 		 status & GPU_FAULTSTATUS_ADDRESS_VALID_MASK ? "true" : "false");
+
+#if IS_ENABLED(CONFIG_MIEV)
+	mi_disp_mievent_report(MI_EVENT_GPU_FAULT);
+#endif
 
 	kctx = kbase_ctx_sched_as_to_ctx(kbdev, as_nr);
 	kbase_csf_ctx_handle_fault(kctx, fault);

@@ -92,6 +92,10 @@
 #include <platform/mtk_platform_common/mtk_platform_mali_event.h>
 #endif /* CONFIG_MALI_MTK_MBRAIN_SUPPORT */
 
+#if IS_ENABLED(CONFIG_MIEV)
+#include <mi_event.h>
+#endif
+
 #ifdef CONFIG_MALI_CORESTACK
 bool corestack_driver_control = true;
 #else
@@ -4075,6 +4079,10 @@ static int kbase_pm_do_reset(struct kbase_device *kbdev)
 		return 0;
 	}
 
+#if IS_ENABLED(CONFIG_MIEV)
+	mi_disp_mievent_report(MI_EVENT_GPU_SOFT_RESET_FAULT);
+#endif
+
 	reg_offset = GPU_CONTROL_ENUM(GPU_IRQ_RAWSTAT);
 	reg_val = RESET_COMPLETED;
 
@@ -4148,6 +4156,7 @@ whitebox_directly_hard_reset:
 #ifdef CONFIG_MALI_ARBITER_SUPPORT
 	if (!kbdev->arb.arb_if) {
 #endif
+
 		dev_err(kbdev->dev,
 			"Failed to soft-reset GPU (timed out after %d ms), now attempting a hard reset\n",
 			RESET_TIMEOUT);
@@ -4213,6 +4222,11 @@ whitebox_force_hard_reset:
 			"Failed to hard-reset the GPU (timed out after %d ms)\n",
 			RESET_TIMEOUT);
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+
+#if IS_ENABLED(CONFIG_MIEV)
+		mi_disp_mievent_report(MI_EVENT_GPU_HARD_RESET_FAULT);
+#endif
+
 #ifdef CONFIG_MALI_ARBITER_SUPPORT
 	}
 #endif

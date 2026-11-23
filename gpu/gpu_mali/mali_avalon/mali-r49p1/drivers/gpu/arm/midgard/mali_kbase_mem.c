@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 /*
  *
- * (C) COPYRIGHT 2010-2024 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2010-2025 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -1521,6 +1521,7 @@ int kbase_alloc_phy_pages_helper(struct kbase_mem_phy_alloc *alloc, size_t nr_pa
 				INIT_LIST_HEAD(&sa->link);
 				bitmap_zero(sa->sub_pages, NUM_PAGES_IN_2MB_LARGE_PAGE);
 				sa->page = np;
+				sa->group_id = alloc->group_id;
 
 #if IS_ENABLED(CONFIG_MALI_MTK_PAGE_TABLE_CLUSTERING)
 				for (i = 0; i < nr_left; i++) {
@@ -1645,6 +1646,7 @@ static size_t free_partial_locked(struct kbase_context *kctx, struct kbase_mem_p
 	struct page *p, *head_page;
 	struct kbase_sub_alloc *sa;
 	size_t nr_pages_to_account = 0;
+	struct kbase_mem_pool *temp_pool;
 
 	lockdep_assert_held(&pool->pool_lock);
 	lockdep_assert_held(&kctx->mem_partials_lock);
@@ -1659,7 +1661,16 @@ static size_t free_partial_locked(struct kbase_context *kctx, struct kbase_mem_p
 	}
 	if (bitmap_empty(sa->sub_pages, NUM_PAGES_IN_2MB_LARGE_PAGE)) {
 		list_del(&sa->link);
-		kbase_mem_pool_free_locked(pool, head_page, false);
+
+		if (pool->group_id != sa->group_id) {
+			temp_pool = &kctx->mem_pools.large[sa->group_id];
+			kbase_mem_pool_lock(temp_pool);
+			kbase_mem_pool_free_locked(temp_pool, head_page, false);
+			kbase_mem_pool_unlock(temp_pool);
+		} else {
+			kbase_mem_pool_free_locked(pool, head_page, false);
+		}
+
 		kfree(sa);
 		nr_pages_to_account = NUM_PAGES_IN_2MB_LARGE_PAGE;
 	} else if (bitmap_weight(sa->sub_pages, NUM_PAGES_IN_2MB_LARGE_PAGE) ==
@@ -1856,6 +1867,7 @@ struct tagged_addr *kbase_alloc_phy_pages_helper_locked(struct kbase_mem_phy_all
 				INIT_LIST_HEAD(&sa->link);
 				bitmap_zero(sa->sub_pages, NUM_PAGES_IN_2MB_LARGE_PAGE);
 				sa->page = np;
+				sa->group_id = pool->group_id;
 
 #if IS_ENABLED(CONFIG_MALI_MTK_PAGE_TABLE_CLUSTERING)
 				for (i = 0; i < nr_left; i++) {
@@ -1975,8 +1987,7 @@ invalid_request:
 	return NULL;
 }
 
-static size_t free_partial(struct kbase_context *kctx, int group_id, struct tagged_addr tp,
-			   bool syncback)
+static size_t free_partial(struct kbase_context *kctx, struct tagged_addr tp, bool syncback)
 {
 	struct page *p, *head_page;
 	struct kbase_sub_alloc *sa;
@@ -1992,8 +2003,12 @@ static size_t free_partial(struct kbase_context *kctx, int group_id, struct tagg
 	spin_lock(&kctx->mem_partials_lock);
 	clear_bit(p - head_page, sa->sub_pages);
 	if (bitmap_empty(sa->sub_pages, NUM_PAGES_IN_2MB_LARGE_PAGE)) {
+		struct kbase_mem_pool *pool = &kctx->mem_pools.large[sa->group_id];
+
 		list_del(&sa->link);
-		kbase_mem_pool_free(&kctx->mem_pools.large[group_id], head_page, false);
+		kbase_mem_pool_lock(pool);
+		kbase_mem_pool_free_locked(pool, head_page, false);
+		kbase_mem_pool_unlock(pool);
 		kfree(sa);
 		nr_pages_to_account = NUM_PAGES_IN_2MB_LARGE_PAGE;
 	} else if (bitmap_weight(sa->sub_pages, NUM_PAGES_IN_2MB_LARGE_PAGE) ==
@@ -2057,7 +2072,7 @@ int kbase_free_phy_pages_helper(struct kbase_mem_phy_alloc *alloc, size_t nr_pag
 			nr_pages_to_account += NUM_PAGES_IN_2MB_LARGE_PAGE;
 		} else if (is_partial(*start_free)) {
 			nr_pages_to_account +=
-				free_partial(kctx, alloc->group_id, *start_free, syncback);
+				free_partial(kctx, *start_free, syncback);
 			nr_pages_to_free--;
 			start_free++;
 			freed++;
@@ -2270,7 +2285,14 @@ void kbase_mem_kref_free(struct kref *kref)
 #endif
 			kbase_remove_dma_buf_usage(alloc->imported.umm.kctx, alloc);
 		}
-
+#if MALI_USE_CSF
+		/* Check if delegation of free is required. On true, return directly. The
+		 * alloc will be freed by the deferral-control later when the deferral end
+		 * condition is satisfied.
+		 */
+		if (kbase_csf_scheduler_delegate_imported_buf_alloc_free(alloc))
+			return;
+#endif
 		dma_buf_detach(alloc->imported.umm.dma_buf, alloc->imported.umm.dma_attachment);
 		dma_buf_put(alloc->imported.umm.dma_buf);
 		break;
@@ -2279,6 +2301,14 @@ void kbase_mem_kref_free(struct kref *kref)
 		case KBASE_USER_BUF_STATE_PINNED:
 		case KBASE_USER_BUF_STATE_DMA_MAPPED:
 		case KBASE_USER_BUF_STATE_GPU_MAPPED: {
+#if MALI_USE_CSF
+			/* Check if delegation of free is required. On true, return directly. The
+			 * alloc will be freed by the deferral-control later when the deferral end
+			 * condition is satisfied.
+			 */
+			if (kbase_csf_scheduler_delegate_imported_buf_alloc_free(alloc))
+				return;
+#endif
 			/* It's too late to undo all of the operations that might have been
 			 * done on an imported USER_BUFFER handle, as references have been
 			 * lost already.
